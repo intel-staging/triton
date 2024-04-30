@@ -3,6 +3,7 @@
 #include "mlir/Target/LLVMIR/ModuleTranslation.h"
 #include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
@@ -180,6 +181,12 @@ void init_triton_llvm(py::module &&m) {
       },
       py::keep_alive<0, 2>());
 
+  m.def("to_cpu_module", [](mlir::ModuleOp &mod, llvm::LLVMContext &ctx) {
+    std::unique_ptr<llvm::Module> llvmMod =
+        mlir::translateModuleToLLVMIR(mod, ctx);
+    return llvmMod;
+  });
+
   m.def("optimize_module", [](llvm::Module *mod,
                               const llvm::OptimizationLevel &opt) {
     if (mlir::triton::tools::getBoolEnv("DISABLE_LLVM_OPT"))
@@ -240,6 +247,32 @@ void init_triton_llvm(py::module &&m) {
   });
 
   m.def(
+      "translate_to_bc",
+      [](const std::string llvmIR) -> py::object {
+        py::gil_scoped_release allow_threads;
+        // create LLVM module
+        llvm::LLVMContext context;
+        std::unique_ptr<llvm::MemoryBuffer> buffer =
+            llvm::MemoryBuffer::getMemBuffer(llvmIR.c_str());
+        llvm::SMDiagnostic error;
+        std::unique_ptr<llvm::Module> module =
+            llvm::parseIR(buffer->getMemBufferRef(), error, context);
+        if (!module) {
+          llvm::report_fatal_error(
+              "failed to parse IR: " + error.getMessage() +
+              "lineno: " + std::to_string(error.getLineNo()));
+        }
+        // Write bitcode to a buffer.
+        llvm::SmallVector<char, 0> buf;
+        llvm::BitcodeWriter writer(buf);
+        writer.writeModule(*module);
+        writer.writeStrtab();
+        std::string bitcode(buf.begin(), buf.end());
+        return py::bytes(bitcode);
+      },
+      ret::take_ownership);
+
+  m.def(
       "translate_to_asm",
       [](std::string llvmIR, std::string triple, std::string proc,
          std::string features, std::vector<std::string> flags,
@@ -269,6 +302,14 @@ void init_triton_llvm(py::module &&m) {
           return py::str(obj);
       },
       ret::take_ownership);
+
+  m.def("set_cpu_target_triple", [](llvm::Module *mod) {
+    std::string triple = "x86_64-unknown-linux-gnu";
+    std::string layout = "e-i64:64-v16:16-v24:32-v32:32-v48:64-v96:128-v192:"
+                         "256-v256:256-v512:512-v1024:1024-n8:16:32:64";
+    mod->setTargetTriple(triple);
+    mod->setDataLayout(layout);
+  });
 
   m.def("init_targets", []() {
     static std::once_flag init_flag;
